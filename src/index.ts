@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { handleFileUpload, handleChat, handleGenerate } from './services';
+import { handleFileUpload, handleChat, handleGenerate, handleFineTuned } from './services';
 import * as dotenv from 'dotenv';
 
 // Configure dotenv before any other imports that need env variables
@@ -74,8 +74,8 @@ app.post('/api/chat', async (req: Request, res: Response) => {
 });
 
 /**
- * @route   POST /api/chat
- * @desc    Handles a chat query using RAG with the stored documents.
+ * @route   POST /api/generate
+ * @desc    Handles a chat query using function calling.
  * @access  Public
  */
 app.post('/api/generate', async (req: Request, res: Response) => {
@@ -87,6 +87,31 @@ app.post('/api/generate', async (req: Request, res: Response) => {
         }
 
         const response = await handleGenerate(query, history || []);
+
+        res.status(200).json({
+            message: 'Response generated successfully.',
+            response: response
+        });
+    } catch (error) {
+        console.error('Error during chat:', error);
+        res.status(500).json({ message: 'An error occurred while generating a response.' });
+    }
+});
+
+/**
+ * @route   POST /api/fine-tuned
+ * @desc    Handles a chat query using fine-tuned model.
+ * @access  Public
+ */
+app.post('/api/fine-tuned', async (req: Request, res: Response) => {
+    try {
+        const { query, history } = req.body;
+
+        if (!query) {
+            return res.status(400).json({ message: 'Query is required.' });
+        }
+
+        const response = await handleFineTuned(query, history || []);
 
         res.status(200).json({
             message: 'Response generated successfully.',

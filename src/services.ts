@@ -1,8 +1,11 @@
-import { GoogleGenAI, HarmCategory, HarmBlockThreshold, ContentEmbedding } from "@google/genai";
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold, Type, Part } from "@google/genai";
 import { v4 as uuidv4 } from 'uuid';
 import * as dotenv from 'dotenv';
 import pdfParse from 'pdf-parse';
 import { Pinecone } from '@pinecone-database/pinecone';
+import { getToken } from "./utils/token";
+import { ZOOM_API_BASE_URL } from "./constants";
+import { ragFunctionDeclaration, weatherFunctionDeclaration, zoomFunctionDeclaration } from "./constants/tools";
 
 // Configure dotenv before any other imports that need env variables
 dotenv.config();
@@ -11,11 +14,22 @@ dotenv.config();
 // IMPORTANT: Create a .env file in your root directory and add your API key.
 // GOOGLE_API_KEY=your_api_key_here
 const API_KEY = process.env.GOOGLE_API_KEY as string;
+
+const PROJECT = process.env.GOOGLE_PROJECT as string;
+const LOCATION = process.env.GOOGLE_LOCATION as string;
+const MODEL = process.env.GOOGLE_MODEL as string;
+
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY as string;
 const PINECONE_INDEX_NAME = process.env.PINECONE_INDEX_NAME as string; // You'll need to add this to your .env
+const WEATHER_API = process.env.WEATHER_API_KEY as string;
 
 // --- MODEL & AI SETUP ---
 const genAI = new GoogleGenAI({ apiKey: API_KEY });
+const vertexAI = new GoogleGenAI({
+    vertexai: true,
+    project: PROJECT,
+    location: LOCATION,
+});
 
 const generationConfig = {
     temperature: 0.9,
@@ -25,11 +39,13 @@ const generationConfig = {
 };
 
 const safetySettings = [
-    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF },
 ];
+
+const systemInstruction = `Remember today is ${new Date()}.`;
 
 // --- VECTOR DATABASE ---
 
@@ -194,15 +210,156 @@ export async function handleChat(query: string, history: any[]): Promise<any> {
  * @returns The generated response from the Gemini model.
  */
 export async function handleGenerate(query: string, history: any[]): Promise<string> {
-
     const chatModel = await genAI.models.generateContent({
         model: "gemini-2.5-flash",
-        contents: query,
+        contents: [
+            ...history,
+            {
+                parts: [{
+                    text: query
+                }],
+                role: "user"
+            }
+        ],
         config: {
+            systemInstruction,
             ...generationConfig,
-            safetySettings: safetySettings
+            safetySettings,
+            tools: [{
+                functionDeclarations: [weatherFunctionDeclaration, zoomFunctionDeclaration, ragFunctionDeclaration]
+            }]
         },
     });
 
-    return chatModel.text;
+    // Check for function calls in the response
+    if (chatModel.functionCalls && chatModel.functionCalls.length > 0) {
+        let results: Part[] = [];
+
+        for (const functionCall of chatModel.functionCalls) {
+            console.log(`Function to call: ${functionCall.name}`);
+            console.log(`Arguments: ${JSON.stringify(functionCall.args)}`);
+            const funcArgs: any = functionCall.args;
+
+            if (functionCall.name === 'get_current_temperature') {
+                const res = await fetch(`http://api.weatherstack.com/current?access_key=${WEATHER_API}&query=${encodeURI(funcArgs.location)}`, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                }).then(response => response.json());
+
+                results.push({
+                    functionResponse: {
+                        name: functionCall.name,
+                        response: {
+                            result: res // The 'response' needs to be a dict/object
+                        }
+                    }
+                })
+            } else if (functionCall.name === 'create_zoom_meeting') {
+                const token = await getToken();
+
+                const res = await fetch(
+                    `${ZOOM_API_BASE_URL}/users/me/meetings`,
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            Authorization: `Bearer ${token.access_token}`,
+                        },
+                        body: JSON.stringify({
+                            topic: funcArgs.topic,
+                            settings: {
+                                meeting_invitees: funcArgs.meeting_invitees,
+                            },
+                            start_time: funcArgs.start_time,
+                            timezone: "Asia/Manila"
+                        }),
+                    }
+                ).then(response => response.json());
+
+                results.push({
+                    functionResponse: {
+                        name: functionCall.name,
+                        response: {
+                            result: res // The 'response' needs to be a dict/object
+                        }
+                    }
+                })
+            } else if (functionCall.name === 'rag_intro_llm_prompt_engineering') { // change the function name according to what data source you uploaded.
+                const res = await handleChat(query, history);
+
+                results.push({
+                    functionResponse: {
+                        name: functionCall.name,
+                        response: {
+                            result: res // The 'response' needs to be a dict/object
+                        }
+                    }
+                })
+            }
+        }
+
+        const functionRes = await genAI.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: [
+                ...history,
+                {
+                    parts: [{
+                        text: query
+                    }],
+                    role: "user"
+                },
+                {
+                    parts: results
+                }
+            ],
+            config: {
+                ...generationConfig,
+                safetySettings: safetySettings,
+            }
+        });
+
+        return functionRes.text;
+        // In a real app, you would call your actual function here:
+        // const result = await getCurrentTemperature(functionCall.args);
+    } else {
+        console.log("No function call found in the response.");
+
+        return chatModel.text;
+    }
+}
+
+/**
+ * Handles a chat query using a fine-tuned model.
+ * @param query The user's question.
+ * @param history The previous chat history.
+ * @returns The generated response from the fine-tuned model.
+ */
+export async function handleFineTuned(query: string, history: any[]): Promise<string> {
+    try {
+        console.log(`Handling fine-tuned query: "${query}"`);
+
+        const chatModel = await vertexAI.models.generateContent({
+            model: MODEL,
+            contents: [
+                ...history,
+                {
+                    parts: [{
+                        text: query
+                    }],
+                    role: "user"
+                }
+            ],
+            config: {
+                systemInstruction,
+                ...generationConfig,
+                safetySettings,
+            },
+        });
+
+        console.log("Generated fine-tuned response successfully.");
+        return chatModel.text;
+    } catch (error) {
+        console.error("Error in handleFineTuned:", error);
+    }
 }
